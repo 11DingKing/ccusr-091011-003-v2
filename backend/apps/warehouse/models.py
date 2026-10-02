@@ -1,7 +1,11 @@
 """
 库房管理模型
 """
+from datetime import timedelta
+
+from django.conf import settings
 from django.db import models
+from django.utils import timezone
 from apps.authentication.models import User
 
 
@@ -99,6 +103,14 @@ class Variety(models.Model):
 
 class Goods(models.Model):
     """货物模型"""
+
+    RISK_NORMAL = 'normal'
+    RISK_HIGH = 'high'
+    RISK_CHOICES = [
+        (RISK_NORMAL, '普通物资'),
+        (RISK_HIGH, '高风险物资'),
+    ]
+
     variety = models.ForeignKey(
         Variety, on_delete=models.CASCADE,
         related_name='goods', verbose_name='所属品种'
@@ -108,6 +120,9 @@ class Goods(models.Model):
     specification = models.CharField('规格型号', max_length=200, blank=True)
     quantity = models.DecimalField('库存数量', max_digits=12, decimal_places=2, default=0)
     warning_threshold = models.DecimalField('预警阈值', max_digits=12, decimal_places=2, default=10)
+    risk_level = models.CharField(
+        '风险等级', max_length=10, choices=RISK_CHOICES, default=RISK_NORMAL
+    )
     location = models.CharField('存放位置', max_length=100, blank=True)
     remark = models.TextField('备注', blank=True)
     is_active = models.BooleanField('是否启用', default=True)
@@ -246,3 +261,142 @@ class Approval(models.Model):
     
     def __str__(self):
         return f"{self.stock_out} - {self.get_status_display()}"
+
+
+class ReleaseRequest(models.Model):
+    """受控物资放行申请（按风险等级执行单级或双人复核）。
+
+    状态机：
+        signing  签署中（等待后续步骤）
+        released 已放行（全部签署完成，库存已扣减）
+        rejected 已拒绝（任一步骤拒绝即终态）
+        expired  已过期（超过有效期未完成签署）
+        blocked  权限阻止（已签署人在完成前被停用/降级/删号）
+    """
+
+    class Role(models.TextChoices):
+        APPLICANT = 'applicant', '申请人'
+        FIRST_REVIEWER = 'first_reviewer', '第一复核人'
+        FINAL_RELEASER = 'final_releaser', '最终放行人'
+
+    class Status(models.TextChoices):
+        SIGNING = 'signing', '签署中'
+        RELEASED = 'released', '已放行'
+        REJECTED = 'rejected', '已拒绝'
+        EXPIRED = 'expired', '已过期'
+        BLOCKED = 'blocked', '权限阻止'
+
+    TERMINAL_STATUSES = (Status.RELEASED, Status.REJECTED, Status.EXPIRED, Status.BLOCKED)
+
+    goods = models.ForeignKey(
+        Goods, on_delete=models.PROTECT,
+        related_name='release_requests', verbose_name='货物'
+    )
+    quantity = models.DecimalField('申请数量', max_digits=12, decimal_places=2)
+    receiver = models.CharField('领用人', max_length=100)
+    receiver_dept = models.CharField('领用部门', max_length=100, blank=True)
+    purpose = models.CharField('领用事由', max_length=200, blank=True)
+    # 风险等级与放行所需角色在申请时快照，避免物资后续被修改影响在途申请
+    risk_level = models.CharField('风险等级快照', max_length=10, choices=Goods.RISK_CHOICES)
+    applicant = models.ForeignKey(
+        User, on_delete=models.PROTECT,
+        related_name='release_requests', verbose_name='申请人'
+    )
+    status = models.CharField(
+        '状态', max_length=20, choices=Status.choices, default=Status.SIGNING
+    )
+    expires_at = models.DateTimeField('签署截止时间')
+    closed_reason = models.CharField('终态原因', max_length=200, blank=True)
+    stock_out = models.OneToOneField(
+        StockOut, on_delete=models.PROTECT, null=True, blank=True,
+        related_name='release_request', verbose_name='出库记录'
+    )
+    version = models.PositiveIntegerField('乐观锁版本号', default=0)
+    created_at = models.DateTimeField('创建时间', auto_now_add=True)
+    updated_at = models.DateTimeField('更新时间', auto_now=True)
+
+    class Meta:
+        db_table = 'wh_release_request'
+        verbose_name = '放行申请'
+        verbose_name_plural = verbose_name
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return f"{self.goods.name} - {self.quantity} - {self.get_status_display()}"
+
+    @property
+    def is_terminal(self):
+        return self.status in self.TERMINAL_STATUSES
+
+    @property
+    def required_roles(self):
+        """该申请按风险等级要求的签署角色（有序）。"""
+        if self.risk_level == Goods.RISK_HIGH:
+            return [
+                self.Role.APPLICANT,
+                self.Role.FIRST_REVIEWER,
+                self.Role.FINAL_RELEASER,
+            ]
+        return [self.Role.APPLICANT, self.Role.FINAL_RELEASER]
+
+    @property
+    def is_high_risk(self):
+        return self.risk_level == Goods.RISK_HIGH
+
+    @property
+    def is_expired(self):
+        return not self.is_terminal and timezone.now() >= self.expires_at
+
+    def next_role(self):
+        """返回当前等待签署的角色；全部签完或已终态返回 None。"""
+        if self.is_terminal:
+            return None
+        signed = {s.role for s in self.signatures.all()}
+        for role in self.required_roles:
+            if role not in signed:
+                return role
+        return None
+
+    def missing_steps(self):
+        """返回尚未完成的签署步骤（有序、可直接展示）；终态返回空列表。"""
+        if self.is_terminal:
+            return []
+        signed = {s.role for s in self.signatures.all()}
+        return [role for role in self.required_roles if role not in signed]
+
+
+class ReleaseSignature(models.Model):
+    """放行申请的单次签署记录（申请/复核/放行各一条）。"""
+
+    class Action(models.TextChoices):
+        APPROVED = 'approved', '同意'
+        REJECTED = 'rejected', '拒绝'
+
+    request = models.ForeignKey(
+        ReleaseRequest, on_delete=models.CASCADE,
+        related_name='signatures', verbose_name='放行申请'
+    )
+    role = models.CharField('签署角色', max_length=20, choices=ReleaseRequest.Role.choices)
+    signer = models.ForeignKey(
+        User, on_delete=models.PROTECT,
+        related_name='release_signatures', verbose_name='签署人'
+    )
+    action = models.CharField('签署动作', max_length=10, choices=Action.choices)
+    comment = models.CharField('签署意见', max_length=200, blank=True)
+    signed_at = models.DateTimeField('签署时间', auto_now_add=True)
+
+    class Meta:
+        db_table = 'wh_release_signature'
+        verbose_name = '放行签署记录'
+        verbose_name_plural = verbose_name
+        ordering = ['signed_at', 'id']
+        constraints = [
+            # 每个申请的每个角色只能签署一次，数据库层兜底重复/并发签署
+            models.UniqueConstraint(
+                fields=['request', 'role'], name='uniq_release_role_signature'
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.request_id} - {self.get_role_display()} - {self.signer} - {self.get_action_display()}"
+

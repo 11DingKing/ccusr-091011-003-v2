@@ -121,6 +121,7 @@ class OperationLogMiddleware:
             '/api/goods/': '货物管理',
             '/api/stock-in/': '入库管理',
             '/api/stock-out/': '出库管理',
+            '/api/release-requests/': '放行复核管理',
             '/api/units/': '单位管理',
             '/api/categories/': '品类管理',
             '/api/varieties/': '品种管理',

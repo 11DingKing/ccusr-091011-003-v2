@@ -60,6 +60,8 @@ REST_FRAMEWORK = {
 JWT_SECRET_KEY = os.environ.get("JWT_SECRET_KEY", "local-custody-jwt-key")
 JWT_ALGORITHM = "HS256"
 JWT_EXPIRATION_DELTA = timedelta(hours=24)
+# 放行申请签署有效期（秒），默认 24 小时；超期未完成签署自动过期
+RELEASE_REQUEST_TTL_SECONDS = int(os.environ.get("RELEASE_REQUEST_TTL_SECONDS", 24 * 60 * 60))
 MEDIA_URL = "/media/"
 MEDIA_ROOT = BASE_DIR / "media"
 LOGS_DIR = BASE_DIR / "logs"
