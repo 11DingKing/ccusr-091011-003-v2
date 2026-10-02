@@ -70,7 +70,7 @@ def generate_daily_report():
     # 出库统计
     out_data = StockOut.objects.filter(
         stock_out_time__date=yesterday,
-        status='completed'
+        status__in=('released', 'completed')
     ).aggregate(
         count=Count('id'),
         total=Sum('quantity')

@@ -43,14 +43,14 @@ class DashboardView(APIView):
         # 今日出库统计
         today_out = StockOut.objects.filter(
             stock_out_time__date=today,
-            status='completed'
+            status__in=('released', 'completed')
         ).aggregate(
             count=Count('id'),
             total=Sum('quantity')
         )
         
         # 待审批数量
-        pending_approval_count = StockOut.objects.filter(status='pending').count()
+        pending_approval_count = StockOut.objects.filter(status__in=('pending_review', 'pending_release', 'pending')).count()
         
         # 未读预警数量
         unread_warning_count = Warning.objects.filter(is_read=False).count()
@@ -65,7 +65,7 @@ class DashboardView(APIView):
             ).aggregate(total=Sum('quantity'))
             out_data = StockOut.objects.filter(
                 stock_out_time__date=date,
-                status='completed'
+                status__in=('released', 'completed')
             ).aggregate(total=Sum('quantity'))
             
             in_trend.append({
@@ -131,7 +131,7 @@ class DailyReportView(APIView):
             # 出库统计
             out_data = StockOut.objects.filter(
                 stock_out_time__date=current_date,
-                status='completed'
+                status__in=('released', 'completed')
             ).aggregate(
                 count=Count('id'),
                 total=Sum('quantity')

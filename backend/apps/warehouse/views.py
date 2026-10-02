@@ -3,6 +3,7 @@
 """
 import logging
 import io
+from django.db import transaction
 from django.http import HttpResponse
 from rest_framework.views import APIView
 from rest_framework.permissions import IsAuthenticated
@@ -10,13 +11,16 @@ from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
 from apps.core.response import success_response, error_response
-from .models import Unit, Category, Variety, Goods, StockIn, StockOut, Warning, Approval
+from .models import Unit, Category, Variety, Goods, StockIn, StockOut, Warning
+from . import workflow
 from .serializers import (
     UnitSerializer, UnitCreateSerializer,
     CategorySerializer, CategoryCreateSerializer,
     VarietySerializer, VarietyCreateSerializer,
-    GoodsSerializer, StockInSerializer, StockOutSerializer,
-    WarningSerializer, ApprovalSerializer
+    GoodsSerializer, StockInSerializer,
+    WarningSerializer,
+    ReleaseCreateSerializer, ReleaseSignSerializer,
+    ReleaseListSerializer, ReleaseDetailSerializer,
 )
 
 logger = logging.getLogger('apps')
@@ -589,20 +593,7 @@ class GoodsListView(APIView):
 class StockInListView(APIView):
     """入库记录列表视图"""
     permission_classes = [IsAuthenticated]
-    
-    def get(self, request):
-        return success_response(data={
-            'list': [],
-            'total': 0,
-            'page': 1,
-            'page_size': 10
-        })
 
-
-class StockOutListView(APIView):
-    """出库记录列表视图"""
-    permission_classes = [IsAuthenticated]
-    
     def get(self, request):
         return success_response(data={
             'list': [],
@@ -615,7 +606,7 @@ class StockOutListView(APIView):
 class WarningListView(APIView):
     """预警记录列表视图"""
     permission_classes = [IsAuthenticated]
-    
+
     def get(self, request):
         return success_response(data={
             'list': [],
@@ -625,14 +616,153 @@ class WarningListView(APIView):
         })
 
 
-class ApprovalListView(APIView):
-    """审批记录列表视图"""
+# ==================== 放行申请（双人复核） ====================
+
+class ReleaseListView(APIView):
+    """放行申请列表 / 提交申请"""
     permission_classes = [IsAuthenticated]
-    
+
     def get(self, request):
+        # 先把在途申请的过期/失权状态惰性落库，列表始终展示确定状态
+        workflow.sweep_pending()
+
+        queryset = (
+            StockOut.objects.select_related('operator', 'rejected_by')
+            .all().order_by('-created_at')
+        )
+
+        status = request.query_params.get('status')
+        if status:
+            queryset = queryset.filter(status=status)
+        risk = request.query_params.get('risk_level')
+        if risk:
+            queryset = queryset.filter(risk_level=risk)
+        goods_id = request.query_params.get('goods')
+        if goods_id:
+            queryset = queryset.filter(goods_id=goods_id)
+
+        page = int(request.query_params.get('page', 1))
+        page_size = int(request.query_params.get('page_size', 10))
+        start = (page - 1) * page_size
+
+        total = queryset.count()
+        items = queryset[start:start + page_size]
+        serializer = ReleaseListSerializer(items, many=True)
+
         return success_response(data={
-            'list': [],
-            'total': 0,
-            'page': 1,
-            'page_size': 10
+            'list': serializer.data,
+            'total': total,
+            'page': page,
+            'page_size': page_size,
         })
+
+    def post(self, request):
+        """申请人提交放行申请（风险等级由物资决定，不由前端指定）"""
+        serializer = ReleaseCreateSerializer(data=request.data)
+        if not serializer.is_valid():
+            first_error = list(serializer.errors.values())[0][0]
+            return error_response(message=str(first_error))
+
+        data = serializer.validated_data
+        try:
+            stock_out = workflow.create_release(
+                applicant=request.user,
+                goods_id=data['goods'],
+                quantity=data['quantity'],
+                receiver=data['receiver'],
+                receiver_dept=data.get('receiver_dept', ''),
+                remark=data.get('remark', ''),
+            )
+        except Goods.DoesNotExist:
+            return error_response(message='物资不存在', code=404)
+        except workflow.WorkflowError as exc:
+            return error_response(message=exc.message, code=exc.code)
+
+        logger.info(
+            "User %s created release %s (risk=%s)",
+            request.user.username, stock_out.id, stock_out.risk_level,
+        )
+        detail = _fetch_release_detail(stock_out.id)
+        return success_response(
+            data=ReleaseDetailSerializer(detail).data, message='放行申请已提交'
+        )
+
+
+class ReleaseDetailView(APIView):
+    """放行申请详情：缺少步骤、物资摘要、每次签署记录、终态原因"""
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, pk):
+        stock_out = _fetch_release_detail(pk, lock=True)
+        if stock_out is None:
+            return error_response(message='放行申请不存在', code=404)
+        return success_response(data=ReleaseDetailSerializer(stock_out).data)
+
+
+def _fetch_release_detail(pk, lock=False):
+    """按详情序列化所需预取关联；lock=True 时先在事务内完成惰性状态判定。"""
+    if lock:
+        try:
+            with transaction.atomic():
+                stock_out = workflow.lock_release(pk)
+                workflow.evaluate_state(stock_out)
+        except StockOut.DoesNotExist:
+            return None
+    try:
+        return (
+            StockOut.objects.select_related('operator', 'rejected_by')
+            .prefetch_related('signatures__signer', 'goods__variety__category__unit')
+            .get(pk=pk)
+        )
+    except StockOut.DoesNotExist:
+        return None
+
+
+class ReleaseReviewView(APIView):
+    """第一复核人签署（仅高风险物资需要此步骤）"""
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, pk):
+        from .models import STEP_REVIEW
+        return _dispatch_sign(request, pk, STEP_REVIEW, '第一复核已通过')
+
+
+class ReleaseApproveView(APIView):
+    """最终放行人签署"""
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, pk):
+        from .models import STEP_RELEASE
+        return _dispatch_sign(request, pk, STEP_RELEASE, '放行完成，库存已扣减')
+
+
+def _dispatch_sign(request, pk, step, approve_message):
+    """复核/放行共用的签署入口，保证两类接口行为一致。"""
+    serializer = ReleaseSignSerializer(data=request.data)
+    if not serializer.is_valid():
+        first_error = list(serializer.errors.values())[0][0]
+        return error_response(message=str(first_error))
+
+    action = serializer.validated_data['action']
+    try:
+        stock_out = workflow.sign_release(
+            stock_out_id=pk,
+            signer=request.user,
+            step=step,
+            action=action,
+            remark=serializer.validated_data.get('remark', ''),
+        )
+    except workflow.WorkflowError as exc:
+        # 附带申请当前完整状态（如已过期/已终止、缺少步骤），前端可直接渲染
+        current = _fetch_release_detail(pk)
+        data = ReleaseDetailSerializer(current).data if current is not None else None
+        return error_response(message=exc.message, code=exc.code, data=data)
+
+    message = approve_message if action == 'approve' else '已拒绝放行申请'
+    logger.info("User %s signed release %s step=%s action=%s",
+                request.user.username, pk, step, action)
+    # 事务内的预取缓存在插入签署前建立，重新加载以完整返回签署链条
+    stock_out = _fetch_release_detail(pk)
+    return success_response(
+        data=ReleaseDetailSerializer(stock_out).data, message=message
+    )

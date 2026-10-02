@@ -1,8 +1,36 @@
 """
 库房管理模型
 """
+from datetime import timedelta
+
 from django.db import models
+from django.utils import timezone
 from apps.authentication.models import User
+
+
+# 放行申请有效期（自创建起）
+RELEASE_EXPIRY = timedelta(hours=24)
+
+RISK_LEVELS = [
+    ('low', '低风险'),
+    ('high', '高风险'),
+]
+
+# 放行步骤编码，同时用于签署阶段与状态机
+STEP_APPLY = 'apply'
+STEP_REVIEW = 'review'
+STEP_RELEASE = 'release'
+RELEASE_STEPS = [STEP_APPLY, STEP_REVIEW, STEP_RELEASE]
+
+STEP_LABELS = {
+    STEP_APPLY: '申请',
+    STEP_REVIEW: '第一复核',
+    STEP_RELEASE: '最终放行',
+}
+
+# 高风险物资必须两名不同人员复核：申请、第一复核、最终放行三岗分离
+HIGH_RISK_REQUIRED_STEPS = [STEP_APPLY, STEP_REVIEW, STEP_RELEASE]
+LOW_RISK_REQUIRED_STEPS = [STEP_APPLY, STEP_RELEASE]
 
 
 class Unit(models.Model):
@@ -108,6 +136,9 @@ class Goods(models.Model):
     specification = models.CharField('规格型号', max_length=200, blank=True)
     quantity = models.DecimalField('库存数量', max_digits=12, decimal_places=2, default=0)
     warning_threshold = models.DecimalField('预警阈值', max_digits=12, decimal_places=2, default=10)
+    risk_level = models.CharField(
+        '风险等级', max_length=10, choices=RISK_LEVELS, default='low'
+    )
     location = models.CharField('存放位置', max_length=100, blank=True)
     remark = models.TextField('备注', blank=True)
     is_active = models.BooleanField('是否启用', default=True)
@@ -156,38 +187,151 @@ class StockIn(models.Model):
 
 
 class StockOut(models.Model):
-    """出库记录模型"""
+    """出库放行申请模型
+
+    状态机（所有迁移均在 ``sign``/``reject`` 的行级事务内完成，保证
+    重复签署与并发签署只能产生一个确定结果）::
+
+        pending_review / pending_release
+            -- 任一在岗签署人拒绝 --> rejected（终态）
+            -- 超过 RELEASE_EXPIRY --> expired（终态，惰性判定）
+        pending_release（低风险）/ pending_release（高风险复核通过）
+            -- 最终放行人通过 --> released（终态，扣减库存）
+    """
     STATUS_CHOICES = [
-        ('pending', '待审批'),
-        ('approved', '已通过'),
+        ('pending', '待审批'),            # 兼容历史数据
+        ('pending_review', '待第一复核'),
+        ('pending_release', '待最终放行'),
         ('rejected', '已拒绝'),
-        ('completed', '已完成'),
+        ('expired', '已过期'),
+        ('terminated', '已终止'),         # 签署链条中有人权限被撤销
+        ('released', '已放行'),
+        ('approved', '已通过'),           # 兼容历史数据
+        ('completed', '已完成'),          # 兼容历史数据
     ]
-    
+
     goods = models.ForeignKey(
-        Goods, on_delete=models.CASCADE,
+        Goods, on_delete=models.PROTECT,
         related_name='stock_outs', verbose_name='货物'
     )
     operator = models.ForeignKey(
         User, on_delete=models.SET_NULL, null=True,
-        related_name='stock_out_operations', verbose_name='操作人'
+        related_name='stock_out_applications', verbose_name='申请人'
     )
     receiver = models.CharField('领用人', max_length=100)
     receiver_dept = models.CharField('领用部门', max_length=100, blank=True)
     quantity = models.DecimalField('出库数量', max_digits=12, decimal_places=2)
-    status = models.CharField('状态', max_length=20, choices=STATUS_CHOICES, default='pending')
+    risk_level = models.CharField(
+        '风险等级', max_length=10, choices=RISK_LEVELS, default='low'
+    )
+    # 物资摘要快照：签署人看到的物资信息以申请提交时为准
+    goods_name = models.CharField('货物名称快照', max_length=200, blank=True, default='')
+    goods_code = models.CharField('货物编码快照', max_length=50, blank=True, default='')
+    status = models.CharField(
+        '状态', max_length=20, choices=STATUS_CHOICES, default='pending_review'
+    )
+    current_step = models.CharField(
+        '当前步骤', max_length=20, choices=[(s, STEP_LABELS[s]) for s in RELEASE_STEPS],
+        default=STEP_APPLY
+    )
+    expires_at = models.DateTimeField('有效期至', null=True, blank=True)
+    rejected_at = models.DateTimeField('拒绝时间', null=True, blank=True)
+    reject_step = models.CharField('拒绝步骤', max_length=20, blank=True, default='')
+    rejected_by = models.ForeignKey(
+        User, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='rejected_stock_outs', verbose_name='拒绝人'
+    )
+    reject_reason = models.TextField('拒绝原因', blank=True, default='')
+    terminate_reason = models.CharField('终止原因', max_length=200, blank=True, default='')
+    released_at = models.DateTimeField('放行时间', null=True, blank=True)
     stock_out_time = models.DateTimeField('出库时间', null=True, blank=True)
     remark = models.TextField('备注', blank=True)
     created_at = models.DateTimeField('创建时间', auto_now_add=True)
-    
+
     class Meta:
         db_table = 'wh_stock_out'
-        verbose_name = '出库记录'
+        verbose_name = '出库放行申请'
         verbose_name_plural = verbose_name
         ordering = ['-created_at']
-    
+
     def __str__(self):
         return f"{self.goods.name} - {self.quantity}"
+
+    # ---------- 流程派生属性 ----------
+
+    @property
+    def required_steps(self):
+        """按风险等级要求的签署步骤（有序）"""
+        if self.risk_level == 'high':
+            return list(HIGH_RISK_REQUIRED_STEPS)
+        return list(LOW_RISK_REQUIRED_STEPS)
+
+    @property
+    def is_high_risk(self):
+        return self.risk_level == 'high'
+
+    @property
+    def is_terminal(self):
+        return self.status in (
+            'rejected', 'expired', 'terminated',
+            'released', 'approved', 'completed',
+        )
+
+    @property
+    def is_expired(self):
+        """过期为惰性判定：读取时超过有效期且仍未终结即视为过期"""
+        if self.is_terminal or self.expires_at is None:
+            return False
+        return timezone.now() >= self.expires_at
+
+    def next_step(self, step):
+        steps = self.required_steps
+        try:
+            idx = steps.index(step)
+        except ValueError:
+            return None
+        return steps[idx + 1] if idx + 1 < len(steps) else None
+
+    def missing_steps(self):
+        """返回尚未完成的步骤（含状态、责任人信息），供接口直观展示"""
+        signatures = {s.step: s for s in self.signatures.all()}
+        result = []
+        for step in self.required_steps:
+            sig = signatures.get(step)
+            item = {
+                'step': step,
+                'step_display': STEP_LABELS[step],
+                'done': sig is not None and sig.action == 'approve',
+            }
+            if sig is not None:
+                item['signer'] = sig.signer_name
+                item['signed_at'] = sig.signed_at
+                item['action'] = sig.action
+            result.append(item)
+        return result
+
+    def next_missing_step(self):
+        for item in self.missing_steps():
+            if not item['done']:
+                return item['step']
+        return None
+
+    def goods_summary(self):
+        """每次签署时看到的物资摘要（创建时已按快照冗余保存名称/编码）"""
+        goods = self.goods
+        return {
+            'goods': self.goods_id,
+            'goods_name': self.goods_name or goods.name,
+            'goods_code': self.goods_code or goods.code,
+            'specification': goods.specification,
+            'category_name': getattr(getattr(goods.variety, 'category', None), 'name', ''),
+            'unit_name': goods.variety.unit_name if goods.variety_id else '',
+            'location': goods.location,
+            'quantity': str(self.quantity),
+            'stock_quantity': str(goods.quantity),
+            'risk_level': self.risk_level,
+            'risk_level_display': self.get_risk_level_display(),
+        }
 
 
 class Warning(models.Model):
@@ -217,32 +361,47 @@ class Warning(models.Model):
         return f"{self.goods.name} - {self.get_type_display()}"
 
 
-class Approval(models.Model):
-    """审批记录模型"""
-    STATUS_CHOICES = [
-        ('pending', '待审批'),
-        ('approved', '已通过'),
-        ('rejected', '已拒绝'),
+class ReleaseSignature(models.Model):
+    """放行签署记录：申请、第一复核、最终放行每个步骤恰好一条"""
+    ACTION_CHOICES = [
+        ('approve', '通过'),
+        ('reject', '拒绝'),
     ]
-    
+
     stock_out = models.ForeignKey(
         StockOut, on_delete=models.CASCADE,
-        related_name='approvals', verbose_name='出库记录'
+        related_name='signatures', verbose_name='放行申请'
     )
-    approver = models.ForeignKey(
-        User, on_delete=models.SET_NULL, null=True,
-        related_name='approvals', verbose_name='审批人'
+    step = models.CharField('签署步骤', max_length=20, choices=[(s, STEP_LABELS[s]) for s in RELEASE_STEPS])
+    signer = models.ForeignKey(
+        User, on_delete=models.PROTECT,
+        related_name='release_signatures', verbose_name='签署人'
     )
-    status = models.CharField('审批状态', max_length=20, choices=STATUS_CHOICES, default='pending')
-    remark = models.TextField('审批意见', blank=True)
-    created_at = models.DateTimeField('创建时间', auto_now_add=True)
-    updated_at = models.DateTimeField('更新时间', auto_now=True)
-    
+    action = models.CharField('签署动作', max_length=10, choices=ACTION_CHOICES)
+    # 签署时刻签署人看到的物资摘要（JSON）
+    goods_snapshot = models.JSONField('物资摘要', default=dict, blank=True)
+    remark = models.TextField('签署意见', blank=True, default='')
+    signed_at = models.DateTimeField('签署时间', auto_now_add=True)
+
     class Meta:
-        db_table = 'wh_approval'
-        verbose_name = '审批记录'
+        db_table = 'wh_release_signature'
+        verbose_name = '放行签署记录'
         verbose_name_plural = verbose_name
-        ordering = ['-created_at']
-    
+        ordering = ['signed_at']
+        constraints = [
+            models.UniqueConstraint(
+                fields=['stock_out', 'step'],
+                name='uniq_signature_per_stockout_step',
+            ),
+        ]
+
     def __str__(self):
-        return f"{self.stock_out} - {self.get_status_display()}"
+        return f"{self.stock_out_id}:{self.step}:{self.action}"
+
+    @property
+    def signer_name(self):
+        return self.signer.real_name or self.signer.username if self.signer_id else ''
+
+    @property
+    def step_display(self):
+        return STEP_LABELS.get(self.step, self.step)

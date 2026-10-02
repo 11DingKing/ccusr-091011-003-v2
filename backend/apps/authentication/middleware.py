@@ -126,6 +126,7 @@ class OperationLogMiddleware:
             '/api/varieties/': '品种管理',
             '/api/attendance-persons/': '考勤人员管理',
             '/api/stock-out-persons/': '出库人员管理',
+            '/api/releases/': '放行复核管理',
             '/api/approvals/': '审批管理',
             '/api/warnings/': '预警管理',
         }

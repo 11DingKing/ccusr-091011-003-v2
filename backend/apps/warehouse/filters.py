@@ -3,7 +3,7 @@
 """
 import django_filters
 from django.db.models import F
-from .models import Unit, Category, Variety, Goods, StockIn, StockOut, Warning, Approval
+from .models import Unit, Category, Variety, Goods, StockIn, StockOut, Warning
 
 
 class UnitFilter(django_filters.FilterSet):
@@ -82,16 +82,7 @@ class WarningFilter(django_filters.FilterSet):
     """预警过滤器"""
     is_read = django_filters.BooleanFilter(field_name='is_read')
     type = django_filters.CharFilter(field_name='type')
-    
+
     class Meta:
         model = Warning
         fields = ['is_read', 'type']
-
-
-class ApprovalFilter(django_filters.FilterSet):
-    """审批过滤器"""
-    status = django_filters.CharFilter(field_name='status')
-    
-    class Meta:
-        model = Approval
-        fields = ['status']
